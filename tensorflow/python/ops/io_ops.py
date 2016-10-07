@@ -82,6 +82,12 @@ Queues](../../how_tos/threading_and_queues/index.md).
 @@RandomShuffleQueue
 @@PriorityQueue
 
+## Conditional Accumulators
+
+@@ConditionalAccumulatorBase
+@@ConditionalAccumulator
+@@SparseConditionalAccumulator
+
 ## Dealing with the filesystem
 
 @@matching_files
@@ -210,6 +216,10 @@ ops.RegisterShape("Save")(common_shapes.call_cpp_shape_fn)
 ops.RegisterShape("SaveSlices")(common_shapes.call_cpp_shape_fn)
 ops.RegisterShape("ShardedFilename")(common_shapes.call_cpp_shape_fn)
 ops.RegisterShape("ShardedFilespec")(common_shapes.call_cpp_shape_fn)
+
+ops.RegisterShape("SaveV2")(common_shapes.call_cpp_shape_fn)
+ops.RegisterShape("RestoreV2")(common_shapes.call_cpp_shape_fn)
+ops.RegisterShape("MergeV2Checkpoints")(common_shapes.call_cpp_shape_fn)
 
 
 class ReaderBase(object):

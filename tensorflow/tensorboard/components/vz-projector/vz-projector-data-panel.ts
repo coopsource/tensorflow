@@ -13,84 +13,72 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-import {CheckpointInfo, ColumnStats, DataProvider, parseRawMetadata, parseRawTensors} from './data-loader';
+import {ColorOption, ColumnStats} from './data';
+import {CheckpointInfo, DataProvider, parseRawMetadata, parseRawTensors} from './data-loader';
 import {Projector} from './vz-projector';
+import {ColorLegendRenderInfo, ColorLegendThreshold} from './vz-projector-legend';
 // tslint:disable-next-line:no-unused-variable
 import {PolymerElement, PolymerHTMLElement} from './vz-projector-util';
 
 export let DataPanelPolymer = PolymerElement({
   is: 'vz-projector-data-panel',
   properties: {
-    selectedTensor: {type: String, observer: 'selectedTensorChanged'},
-    colorOption: {type: Object, notify: true},
-    labelOption: {type: String, notify: true}
+    selectedTensor: {type: String, observer: '_selectedTensorChanged'},
+    selectedRun: {type: String, observer: '_selectedRunChanged'},
+    colorOption: {type: Object, notify: true, observer: '_colorOptionChanged'},
+    labelOption: {type: String, notify: true},
+    normalizeData: Boolean
   }
 });
-
-export interface ColorOption {
-  name: string;
-  desc?: string;
-  map?: (value: string|number) => string;
-  isSeparator?: boolean;
-};
 
 export class DataPanel extends DataPanelPolymer {
   labelOption: string;
   colorOption: ColorOption;
 
+  private normalizeData: boolean;
   private labelOptions: string[];
   private colorOptions: ColorOption[];
   private dom: d3.Selection<any>;
 
   private selectedTensor: string;
+  private selectedRun: string;
   private dataProvider: DataProvider;
   private tensorNames: {name: string, shape: number[]}[];
+  private runNames: string[];
   private projector: Projector;
   private checkpointInfo: CheckpointInfo;
+  private colorLegendRenderInfo: ColorLegendRenderInfo;
 
   ready() {
     this.dom = d3.select(this);
+    this.normalizeData = true;
   }
 
-  initialize(projector: Projector, dp: DataProvider, dataInfo: CheckpointInfo) {
+  initialize(projector: Projector, dp: DataProvider) {
     this.projector = projector;
     this.dataProvider = dp;
-    this.checkpointInfo = dataInfo;
-    this.setupUI();
-    let defaultTensor = dp.getDefaultTensor();
-    if (defaultTensor != null) {
-      this.selectedTensor = defaultTensor;
-    }
+    this.setupUploadButtons();
+
+    // Tell the projector whenever the data normalization changes.
+    // Unknown why, but the polymer checkbox button stops working as soon as
+    // you do d3.select() on it.
+    this.querySelector('#normalize-data-checkbox')
+        .addEventListener('change', () => {
+          this.projector.setNormalizeData(this.normalizeData);
+        });
+
+    // Get all the runs.
+    this.dataProvider.retrieveRuns(runs => {
+      this.runNames = runs;
+      // If there is only 1 run, choose that one by default.
+      if (this.runNames.length === 1) {
+        this.selectedRun = runs[0];
+      }
+    });
   }
 
   getSeparatorClass(isSeparator: boolean): string {
     return isSeparator ? 'separator' : null;
-  }
-
-  private setupUI() {
-    this.setupUploadButtons();
-    let names = Object.keys(this.checkpointInfo.tensors)
-                    .filter(name => {
-                      let shape = this.checkpointInfo.tensors[name].shape;
-                      return shape.length === 2 && shape[0] > 1 && shape[1] > 1;
-                    })
-                    .sort((a, b) => {
-                      let sizeA = this.checkpointInfo.tensors[a].shape[0];
-                      let sizeB = this.checkpointInfo.tensors[b].shape[0];
-                      if (sizeA === sizeB) {
-                        // If the same dimension, sort alphabetically by tensor
-                        // name.
-                        return a <= b ? -1 : 1;
-                      }
-                      // Sort by first tensor dimension.
-                      return sizeB - sizeA;
-                    });
-    this.tensorNames = names.map(name => {
-      return {name, shape: this.checkpointInfo.tensors[name].shape};
-    });
-    this.dom.select('#checkpoint-file')
-        .text(this.checkpointInfo.checkpointFile)
-        .attr('title', this.checkpointInfo.checkpointFile);
   }
 
   updateMetadataUI(columnStats: ColumnStats[], metadataFile: string) {
@@ -99,14 +87,17 @@ export class DataPanel extends DataPanelPolymer {
         .attr('title', metadataFile);
     // Label by options.
     let labelIndex = -1;
-    this.labelOptions = columnStats.length > 1 ? columnStats.map((stats, i) => {
-      // Make the default label by the first non-numeric column.
-      if (!stats.isNumeric && labelIndex === -1) {
-        labelIndex = i;
-      }
-      return stats.name;
-    }) :
-                                                 ['label'];
+    if (columnStats.length > 1) {
+      this.labelOptions = columnStats.map((stats, i) => {
+        // Make the default label by the first non-numeric column.
+        if (!stats.isNumeric && labelIndex === -1) {
+          labelIndex = i;
+        }
+        return stats.name;
+      });
+    } else {
+      this.labelOptions = ['label'];
+    }
     this.labelOption = this.labelOptions[Math.max(0, labelIndex)];
 
     // Color by options.
@@ -123,28 +114,32 @@ export class DataPanel extends DataPanelPolymer {
             })
             .map(stats => {
               let map: (v: string|number) => string;
+              let items: {label: string, count: number}[];
+              let thresholds: ColorLegendThreshold[];
               if (!stats.tooManyUniqueValues) {
                 let scale = d3.scale.category20();
                 let range = scale.range();
                 // Re-order the range.
                 let newRange = range.map((color, i) => {
-                  let index = (i * 2) % (range.length - 1);
-                  if (index === 0) {
-                    index = range.length - 1;
-                  }
+                  let index = (i * 3) % range.length;
                   return range[index];
                 });
-                scale.range(newRange).domain(stats.uniqueValues);
+                items = stats.uniqueEntries;
+                scale.range(newRange).domain(items.map(x => x.label));
                 map = scale;
               } else {
+                thresholds = [
+                  {color: '#ffffdd', value: stats.min},
+                  {color: '#1f2d86', value: stats.max}
+                ];
                 map = d3.scale.linear<string>()
-                          .domain([stats.min, stats.max])
-                          .range(['white', 'black']);
+                          .domain(thresholds.map(t => t.value))
+                          .range(thresholds.map(t => t.color));
               }
               let desc = stats.tooManyUniqueValues ?
                   'gradient' :
-                  stats.uniqueValues.length + ' colors';
-              return {name: stats.name, desc: desc, map: map};
+                  stats.uniqueEntries.length + ' colors';
+              return {name: stats.name, desc, map, items, thresholds};
             });
     if (metadataColorOption.length > 0) {
       // Add a separator line between built-in color maps
@@ -155,20 +150,80 @@ export class DataPanel extends DataPanelPolymer {
     this.colorOption = this.colorOptions[0];
   }
 
-  // tslint:disable-next-line:no-unused-variable
-  private selectedTensorChanged() {
-    this.dataProvider.getTensor(this.selectedTensor, ds => {
+  setNormalizeData(normalizeData: boolean) {
+    this.normalizeData = normalizeData;
+  }
+
+  _selectedTensorChanged() {
+    if (this.selectedTensor == null) {
+      return;
+    }
+    this.dataProvider.retrieveTensor(
+        this.selectedRun, this.selectedTensor, ds => {
       let metadataFile =
           this.checkpointInfo.tensors[this.selectedTensor].metadataFile;
       if (metadataFile) {
-        this.dataProvider.getMetadata(ds, this.selectedTensor, stats => {
-          this.projector.updateDataSource(ds);
-          this.updateMetadataUI(stats, metadataFile);
-        });
+        this.dataProvider.retrieveMetadata(
+            this.selectedRun, this.selectedTensor, metadata => {
+              this.updateMetadataUI(metadata.stats, metadataFile);
+              this.projector.updateDataSet(ds, metadata);
+            });
       } else {
-        this.projector.updateDataSource(ds);
+        this.projector.updateDataSet(ds, null);
       }
     });
+  }
+
+  _selectedRunChanged() {
+    this.dataProvider.retrieveCheckpointInfo(this.selectedRun, info => {
+      this.checkpointInfo = info;
+      let names =
+          Object.keys(this.checkpointInfo.tensors)
+              .filter(name => {
+                let shape = this.checkpointInfo.tensors[name].shape;
+                return shape.length === 2 && shape[0] > 1 && shape[1] > 1;
+              })
+              .sort((a, b) => {
+                let sizeA = this.checkpointInfo.tensors[a].shape[0];
+                let sizeB = this.checkpointInfo.tensors[b].shape[0];
+                if (sizeA === sizeB) {
+                  // If the same dimension, sort alphabetically by tensor
+                  // name.
+                  return a <= b ? -1 : 1;
+                }
+                // Sort by first tensor dimension.
+                return sizeB - sizeA;
+              });
+      this.tensorNames = names.map(name => {
+        return {name, shape: this.checkpointInfo.tensors[name].shape};
+      });
+      this.dom.select('#checkpoint-file')
+          .text(this.checkpointInfo.checkpointFile)
+          .attr('title', this.checkpointInfo.checkpointFile);
+      this.dataProvider.getDefaultTensor(this.selectedRun, defaultTensor => {
+        this.selectedTensor = defaultTensor;
+      });
+    });
+  }
+
+  _colorOptionChanged() {
+    if (this.colorOption.map == null) {
+      this.colorLegendRenderInfo = null;
+    } else if (this.colorOption.items) {
+      let items = this.colorOption.items.map(item => {
+        return {
+          color: this.colorOption.map(item.label),
+          label: item.label,
+          count: item.count
+        };
+      });
+      this.colorLegendRenderInfo = {items, thresholds: null};
+    } else {
+      this.colorLegendRenderInfo = {
+        items: null,
+        thresholds: this.colorOption.thresholds
+      };
+    }
   }
 
   private tensorWasReadFromFile(rawContents: string, fileName: string) {
@@ -176,14 +231,14 @@ export class DataPanel extends DataPanelPolymer {
       this.dom.select('#checkpoint-file')
           .text(fileName)
           .attr('title', fileName);
-      this.projector.updateDataSource(ds);
+      this.projector.updateDataSet(ds, null);
     });
   }
 
   private metadataWasReadFromFile(rawContents: string, fileName: string) {
-    parseRawMetadata(rawContents, this.projector.dataSource, stats => {
-      this.projector.updateDataSource(this.projector.dataSource);
-      this.updateMetadataUI(stats, fileName);
+    parseRawMetadata(rawContents, metadata => {
+      this.projector.updateDataSet(this.projector.currentDataSet, metadata);
+      this.updateMetadataUI(metadata.stats, fileName);
     });
   }
 
@@ -228,10 +283,18 @@ export class DataPanel extends DataPanelPolymer {
     });
   }
 
-  // tslint:disable-next-line:no-unused-variable
-  private getNumTensorsLabel(tensorNames: string[]) {
-    return tensorNames.length === 1 ? '1 tensor' :
-                                      tensorNames.length + ' tensors';
+  _getNumTensorsLabel(): string {
+    return this.tensorNames.length === 1 ? '1 tensor' :
+                                           this.tensorNames.length + ' tensors';
+  }
+
+  _getNumRunsLabel(): string {
+    return this.runNames.length === 1 ? '1 run' :
+                                        this.runNames.length + ' runs';
+  }
+
+  _hasChoices(choices: any[]): boolean {
+    return choices.length > 1;
   }
 }
 

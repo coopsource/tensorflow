@@ -210,7 +210,9 @@ class CommandHandlerRegistryTest(test_util.TensorFlowTestCase):
     # The registry should catch and wrap exceptions that occur during command
     # handling.
     cmd_output = registry.dispatch_command("raise_exception", [])
-    self.assertEqual(2, len(cmd_output.lines))
+    # The error output contains a stack trace.
+    # So the line count should be >= 2.
+    self.assertGreater(len(cmd_output.lines), 2)
     self.assertTrue(cmd_output.lines[0].startswith(
         "Error occurred during handling of command"))
     self.assertTrue(cmd_output.lines[1].endswith(self._intentional_error_msg))
@@ -254,11 +256,14 @@ class CommandHandlerRegistryTest(test_util.TensorFlowTestCase):
     self.assertFalse(help_lines[4])
     self.assertFalse(help_lines[5])
 
-    self.assertEqual("noop", help_lines[6])
-    self.assertTrue(help_lines[7].endswith("Aliases: n, NOOP"))
-    self.assertFalse(help_lines[8])
-    self.assertTrue(help_lines[9].endswith("No operation."))
-    self.assertTrue(help_lines[10].endswith("I.e., do nothing."))
+    # The default help command should appear in the help output.
+    self.assertEqual("help", help_lines[6])
+
+    self.assertEqual("noop", help_lines[12])
+    self.assertTrue(help_lines[13].endswith("Aliases: n, NOOP"))
+    self.assertFalse(help_lines[14])
+    self.assertTrue(help_lines[15].endswith("No operation."))
+    self.assertTrue(help_lines[16].endswith("I.e., do nothing."))
 
   def testGetHelpSingleCommand(self):
     registry = debugger_cli_common.CommandHandlerRegistry()
@@ -296,6 +301,55 @@ class CommandHandlerRegistryTest(test_util.TensorFlowTestCase):
 
     self.assertEqual("Invalid command prefix: \"foo\"", help_lines[0])
 
+  def testHelpCommandWithoutIntro(self):
+    registry = debugger_cli_common.CommandHandlerRegistry()
+    registry.register_command_handler(
+        "noop",
+        self._noop_handler,
+        "No operation.\nI.e., do nothing.",
+        prefix_aliases=["n", "NOOP"])
+    registry.register_command_handler(
+        "cols",
+        self._echo_screen_cols,
+        "Show screen width in number of columns.",
+        prefix_aliases=["c"])
+
+    # Get help for all commands.
+    output = registry.dispatch_command("help", [])
+    self.assertEqual(["cols", "  Aliases: c", "",
+                      "  Show screen width in number of columns.", "", "",
+                      "help", "  Aliases: h", "", "  Print this help message.",
+                      "", "", "noop", "  Aliases: n, NOOP", "",
+                      "  No operation.", "  I.e., do nothing.", "", ""],
+                     output.lines)
+
+    # Get help for one specific command prefix.
+    output = registry.dispatch_command("help", ["noop"])
+    self.assertEqual(["noop", "  Aliases: n, NOOP", "", "  No operation.",
+                      "  I.e., do nothing."], output.lines)
+
+    # Get help for a nonexistent command prefix.
+    output = registry.dispatch_command("help", ["foo"])
+    self.assertEqual(["Invalid command prefix: \"foo\""], output.lines)
+
+  def testHelpCommandWithIntro(self):
+    registry = debugger_cli_common.CommandHandlerRegistry()
+    registry.register_command_handler(
+        "noop",
+        self._noop_handler,
+        "No operation.\nI.e., do nothing.",
+        prefix_aliases=["n", "NOOP"])
+
+    help_intro = ["Introductory comments.", ""]
+    registry.set_help_intro(help_intro)
+
+    output = registry.dispatch_command("help", [])
+    self.assertEqual(
+        help_intro + ["help", "  Aliases: h", "", "  Print this help message.",
+                      "", "", "noop", "  Aliases: n, NOOP", "",
+                      "  No operation.", "  I.e., do nothing.", "", ""],
+        output.lines)
+
 
 class RegexFindTest(test_util.TensorFlowTestCase):
 
@@ -324,7 +378,7 @@ class RegexFindTest(test_util.TensorFlowTestCase):
                      new_screen_output.font_attr_segs[0])
 
 
-class WrapScreenOuptutTest(test_util.TensorFlowTestCase):
+class WrapScreenOutputTest(test_util.TensorFlowTestCase):
 
   def setUp(self):
     self._orig_screen_output = debugger_cli_common.RichTextLines(
@@ -424,6 +478,175 @@ class WrapScreenOuptutTest(test_util.TensorFlowTestCase):
     with self.assertRaisesRegexp(ValueError, "Invalid type of input cols"):
       debugger_cli_common.wrap_rich_text_lines(
           debugger_cli_common.RichTextLines(["foo", "bar"]), "12")
+
+
+class TabCompletionRegistryTest(test_util.TensorFlowTestCase):
+
+  def setUp(self):
+    self._tc_reg = debugger_cli_common.TabCompletionRegistry()
+
+    # Register the items in an unsorted order deliberately, to test the sorted
+    # output from get_completions().
+    self._tc_reg.register_tab_comp_context(
+        ["print_tensor", "pt"],
+        ["node_b:1", "node_b:2", "node_a:1", "node_a:2"])
+    self._tc_reg.register_tab_comp_context(["node_info"],
+                                           ["node_c", "node_b", "node_a"])
+
+  def testTabCompletion(self):
+    # The returned completions should have sorted order.
+    self.assertEqual(
+        (["node_a:1", "node_a:2", "node_b:1", "node_b:2"], "node_"),
+        self._tc_reg.get_completions("print_tensor", "node_"))
+
+    self.assertEqual((["node_a:1", "node_a:2", "node_b:1", "node_b:2"],
+                      "node_"), self._tc_reg.get_completions("pt", ""))
+
+    self.assertEqual((["node_a:1", "node_a:2"], "node_a:"),
+                     self._tc_reg.get_completions("print_tensor", "node_a"))
+
+    self.assertEqual((["node_a:1"], "node_a:1"),
+                     self._tc_reg.get_completions("pt", "node_a:1"))
+
+    self.assertEqual(([], ""),
+                     self._tc_reg.get_completions("print_tensor", "node_a:3"))
+
+    self.assertEqual((None, None), self._tc_reg.get_completions("foo", "node_"))
+
+  def testExtendCompletionItems(self):
+    self.assertEqual(
+        (["node_a:1", "node_a:2", "node_b:1", "node_b:2"], "node_"),
+        self._tc_reg.get_completions("print_tensor", "node_"))
+    self.assertEqual((["node_a", "node_b", "node_c"], "node_"),
+                     self._tc_reg.get_completions("node_info", "node_"))
+
+    self._tc_reg.extend_comp_items("print_tensor", ["node_A:1", "node_A:2"])
+
+    self.assertEqual((["node_A:1", "node_A:2", "node_a:1", "node_a:2",
+                       "node_b:1", "node_b:2"], "node_"),
+                     self._tc_reg.get_completions("print_tensor", "node_"))
+
+    # Extending the completions for one of the context's context words should
+    # have taken effect on other context words of the same context as well.
+    self.assertEqual((["node_A:1", "node_A:2", "node_a:1", "node_a:2",
+                       "node_b:1", "node_b:2"], "node_"),
+                     self._tc_reg.get_completions("pt", "node_"))
+    self.assertEqual((["node_a", "node_b", "node_c"], "node_"),
+                     self._tc_reg.get_completions("node_info", "node_"))
+
+  def testExtendCompletionItemsNonexistentContext(self):
+    with self.assertRaisesRegexp(
+        KeyError, "Context word \"foo\" has not been registered"):
+      self._tc_reg.extend_comp_items("foo", ["node_A:1", "node_A:2"])
+
+  def testRemoveCompletionItems(self):
+    self.assertEqual(
+        (["node_a:1", "node_a:2", "node_b:1", "node_b:2"], "node_"),
+        self._tc_reg.get_completions("print_tensor", "node_"))
+    self.assertEqual((["node_a", "node_b", "node_c"], "node_"),
+                     self._tc_reg.get_completions("node_info", "node_"))
+
+    self._tc_reg.remove_comp_items("pt", ["node_a:1", "node_a:2"])
+
+    self.assertEqual((["node_b:1", "node_b:2"], "node_b:"),
+                     self._tc_reg.get_completions("print_tensor", "node_"))
+    self.assertEqual((["node_a", "node_b", "node_c"], "node_"),
+                     self._tc_reg.get_completions("node_info", "node_"))
+
+  def testRemoveCompletionItemsNonexistentContext(self):
+    with self.assertRaisesRegexp(
+        KeyError, "Context word \"foo\" has not been registered"):
+      self._tc_reg.remove_comp_items("foo", ["node_a:1", "node_a:2"])
+
+  def testDeregisterContext(self):
+    self.assertEqual(
+        (["node_a:1", "node_a:2", "node_b:1", "node_b:2"], "node_"),
+        self._tc_reg.get_completions("print_tensor", "node_"))
+    self.assertEqual((["node_a", "node_b", "node_c"], "node_"),
+                     self._tc_reg.get_completions("node_info", "node_"))
+
+    self._tc_reg.deregister_context(["print_tensor"])
+
+    self.assertEqual((None, None),
+                     self._tc_reg.get_completions("print_tensor", "node_"))
+
+    # The alternative context word should be unaffected.
+    self.assertEqual(
+        (["node_a:1", "node_a:2", "node_b:1", "node_b:2"], "node_"),
+        self._tc_reg.get_completions("pt", "node_"))
+
+  def testDeregisterNonexistentContext(self):
+    self.assertEqual(
+        (["node_a:1", "node_a:2", "node_b:1", "node_b:2"], "node_"),
+        self._tc_reg.get_completions("print_tensor", "node_"))
+    self.assertEqual((["node_a", "node_b", "node_c"], "node_"),
+                     self._tc_reg.get_completions("node_info", "node_"))
+
+    self._tc_reg.deregister_context(["print_tensor"])
+
+    with self.assertRaisesRegexp(
+        KeyError,
+        "Cannot deregister unregistered context word \"print_tensor\""):
+      self._tc_reg.deregister_context(["print_tensor"])
+
+
+class CommandHistoryTest(test_util.TensorFlowTestCase):
+
+  def setUp(self):
+    self._cmd_hist = debugger_cli_common.CommandHistory(limit=3)
+
+  def testLookUpMostRecent(self):
+    self.assertEqual([], self._cmd_hist.most_recent_n(3))
+
+    self._cmd_hist.add_command("list_tensors")
+    self._cmd_hist.add_command("node_info node_a")
+
+    self.assertEqual(["node_info node_a"], self._cmd_hist.most_recent_n(1))
+    self.assertEqual(["list_tensors", "node_info node_a"],
+                     self._cmd_hist.most_recent_n(2))
+    self.assertEqual(["list_tensors", "node_info node_a"],
+                     self._cmd_hist.most_recent_n(3))
+
+    self._cmd_hist.add_command("node_info node_b")
+
+    self.assertEqual(["node_info node_b"], self._cmd_hist.most_recent_n(1))
+    self.assertEqual(["node_info node_a", "node_info node_b"],
+                     self._cmd_hist.most_recent_n(2))
+    self.assertEqual(["list_tensors", "node_info node_a", "node_info node_b"],
+                     self._cmd_hist.most_recent_n(3))
+    self.assertEqual(["list_tensors", "node_info node_a", "node_info node_b"],
+                     self._cmd_hist.most_recent_n(4))
+
+    # Go over the limit.
+    self._cmd_hist.add_command("node_info node_a")
+
+    self.assertEqual(["node_info node_a"], self._cmd_hist.most_recent_n(1))
+    self.assertEqual(["node_info node_b", "node_info node_a"],
+                     self._cmd_hist.most_recent_n(2))
+    self.assertEqual(
+        ["node_info node_a", "node_info node_b", "node_info node_a"],
+        self._cmd_hist.most_recent_n(3))
+    self.assertEqual(
+        ["node_info node_a", "node_info node_b", "node_info node_a"],
+        self._cmd_hist.most_recent_n(4))
+
+  def testLookUpPrefix(self):
+    self._cmd_hist.add_command("node_info node_b")
+    self._cmd_hist.add_command("list_tensors")
+    self._cmd_hist.add_command("node_info node_a")
+
+    self.assertEqual(["node_info node_b", "node_info node_a"],
+                     self._cmd_hist.lookup_prefix("node_info", 10))
+
+    self.assertEqual(["node_info node_a"], self._cmd_hist.lookup_prefix(
+        "node_info", 1))
+
+    self.assertEqual([], self._cmd_hist.lookup_prefix("print_tensor", 10))
+
+  def testAddNonStrCommand(self):
+    with self.assertRaisesRegexp(
+        TypeError, "Attempt to enter non-str entry to command history"):
+      self._cmd_hist.add_command(["print_tensor node_a:0"])
 
 
 if __name__ == "__main__":

@@ -54,10 +54,7 @@ config_setting(
 
 package_group(
     name = "internal",
-    packages = [
-        "//learning/vis/...",
-        "//tensorflow/...",
-    ],
+    packages = ["//tensorflow/..."],
 )
 
 sh_binary(
@@ -113,11 +110,11 @@ filegroup(
         "//tensorflow/contrib/learn:all_files",
         "//tensorflow/contrib/learn/python/learn/datasets:all_files",
         "//tensorflow/contrib/linear_optimizer:all_files",
-        "//tensorflow/contrib/linear_optimizer/kernels:all_files",
         "//tensorflow/contrib/lookup:all_files",
         "//tensorflow/contrib/losses:all_files",
         "//tensorflow/contrib/metrics:all_files",
         "//tensorflow/contrib/metrics/kernels:all_files",
+        "//tensorflow/contrib/ndlstm:all_files",
         "//tensorflow/contrib/opt:all_files",
         "//tensorflow/contrib/quantization:all_files",
         "//tensorflow/contrib/quantization/kernels:all_files",

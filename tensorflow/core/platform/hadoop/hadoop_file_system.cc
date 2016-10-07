@@ -127,12 +127,13 @@ Status HadoopFileSystem::Connect(StringPiece fname, hdfsFS* fs) {
 
   StringPiece scheme, namenode, path;
   ParseURI(fname, &scheme, &namenode, &path);
+  const string nn = namenode.ToString();
 
   hdfsBuilder* builder = hdfs_->hdfsNewBuilder();
   if (scheme == "file") {
     hdfs_->hdfsBuilderSetNameNode(builder, nullptr);
   } else {
-    hdfs_->hdfsBuilderSetNameNode(builder, namenode.ToString().c_str());
+    hdfs_->hdfsBuilderSetNameNode(builder, nn.c_str());
   }
   *fs = hdfs_->hdfsBuilderConnect(builder);
   if (*fs == nullptr) {
@@ -391,6 +392,12 @@ Status HadoopFileSystem::GetFileSize(const string& fname, uint64* size) {
 Status HadoopFileSystem::RenameFile(const string& src, const string& target) {
   hdfsFS fs = nullptr;
   TF_RETURN_IF_ERROR(Connect(src, &fs));
+
+  if (hdfs_->hdfsExists(fs, TranslateName(target).c_str()) == 0 &&
+      hdfs_->hdfsDelete(fs, TranslateName(target).c_str(),
+                        /*recursive=*/0) != 0) {
+    return IOError(target, errno);
+  }
 
   if (hdfs_->hdfsRename(fs, TranslateName(src).c_str(),
                         TranslateName(target).c_str()) != 0) {

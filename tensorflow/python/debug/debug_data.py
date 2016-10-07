@@ -19,6 +19,7 @@ from __future__ import print_function
 
 import os
 
+import numpy as np
 from six.moves import xrange  # pylint: disable=redefined-builtin
 
 from tensorflow.core.util import event_pb2
@@ -53,6 +54,30 @@ def load_tensor_from_event_file(event_file_path):
   return tensor_value
 
 
+def parse_node_or_tensor_name(name):
+  """Get the node name from a string that can be node or tensor name.
+
+  Args:
+    name: An input node name (e.g., "node_a") or tensor name (e.g.,
+      "node_a:0"), as a str.
+
+  Returns:
+    1) The node name, as a str. If the input name is a tensor name, i.e.,
+      consists of a colon, the final colon and the following output slot
+      will be stripped.
+    2) If the input name is a tensor name, the output slot, as an int. If
+      the input name is not a tensor name, None.
+  """
+
+  if ":" in name and not name.endswith(":"):
+    node_name = name[:name.rfind(":")]
+    output_slot = int(name[name.rfind(":") + 1:])
+
+    return node_name, output_slot
+  else:
+    return name, None
+
+
 def get_tensor_name(node_name, output_slot):
   """Get tensor name given node name and output slot index.
 
@@ -63,6 +88,7 @@ def get_tensor_name(node_name, output_slot):
   Returns:
     Name of the tensor, as a string.
   """
+
   return "%s:%d" % (node_name, output_slot)
 
 
@@ -155,6 +181,31 @@ def parse_debug_node_name(node_name):
   return watched_node_name, watched_output_slot, debug_op_index, debug_op
 
 
+def has_inf_or_nan(datum, tensor):
+  """A predicate for whether a tensor consists of any bad numerical values.
+
+  This predicate is common enough to merit definition in this module.
+  Bad numerical values include nans and infs.
+  The signature of this function follows the requiremnet of DebugDumpDir's
+  find() method.
+
+  Args:
+    datum: (DebugTensorDatum) Datum metadata.
+    tensor: (numpy.ndarray or None) Value of the tensor. None represents
+      an uninitialized tensor.
+
+  Returns:
+    (bool) True if and only if tensor consists of any nan or inf values.
+  """
+
+  _ = datum  # Datum metadata is unused in this predicte.
+  if tensor is None:
+    # Uninitialized tensor doesn't have bad numerical values.
+    return False
+  else:
+    return np.any(np.isnan(tensor)) or np.any(np.isinf(tensor))
+
+
 class DebugTensorDatum(object):
   """A single tensor dumped by tfdbg.
 
@@ -178,7 +229,6 @@ class DebugTensorDatum(object):
           the value of the debug_dump_rel_path should be
           "ns_1/node_a_0_DebugIdenity_1234456789".
     """
-
     base = os.path.basename(debug_dump_rel_path)
 
     # TODO(cais): Add hostname and pid to support dumps from distributed
@@ -188,9 +238,12 @@ class DebugTensorDatum(object):
     self._debug_op = base.split("_")[-2]
     self._output_slot = int(base.split("_")[-3])
 
+    namespace = os.path.dirname(debug_dump_rel_path)
     node_base_name = "_".join(base.split("_")[:-3])
-    self._node_name = os.path.dirname(
-        debug_dump_rel_path) + "/" + node_base_name
+    if not namespace or namespace == ".":
+      self._node_name = node_base_name
+    else:
+      self._node_name = namespace + "/" + node_base_name
 
     self._file_path = os.path.join(dump_root, debug_dump_rel_path)
 
@@ -636,7 +689,7 @@ class DebugDumpDir(object):
     """Get the inputs of given node according to partition graphs.
 
     Args:
-      node_name: Name of the node
+      node_name: Name of the node.
       is_control: Whether control inputs, rather than non-control inputs, are
       to be returned.
 
@@ -650,7 +703,8 @@ class DebugDumpDir(object):
     """
 
     if self._node_inputs is None or self._node_ctrl_inputs is None:
-      raise RuntimeError("Node inputs are not loaded from partiton graphs yet.")
+      raise RuntimeError(
+          "Node inputs are not loaded from partition graphs yet.")
 
     if node_name not in self._node_inputs:
       raise ValueError("Node '%s' does not exist in partition graphs." %
@@ -678,7 +732,8 @@ class DebugDumpDir(object):
     """
 
     if not self._node_inputs or not self._node_ctrl_inputs:
-      raise RuntimeError("Node inputs are not loaded from partiton graphs yet.")
+      raise RuntimeError(
+          "Node inputs are not loaded from partition graphs yet.")
 
     if node_name not in self._node_inputs:
       raise ValueError("Node '%s' does not exist in partition graphs." %
@@ -750,7 +805,7 @@ class DebugDumpDir(object):
 
     if self._node_recipients is None or self._node_ctrl_recipients is None:
       raise RuntimeError(
-          "Node recipients are not loaded from partiton graphs yet.")
+          "Node recipients are not loaded from partition graphs yet.")
 
     if node_name not in self._node_recipients:
       raise ValueError("Node '%s' does not exist in partition graphs." %
@@ -773,9 +828,28 @@ class DebugDumpDir(object):
     """
 
     if self._devices is None:
-      raise RuntimeError("Devices are not loaded from partiton graphs yet.")
+      raise RuntimeError("Devices are not loaded from partition graphs yet.")
 
     return self._devices
+
+  def node_exists(self, node_name):
+    """Test if a node exists in the partition graphs.
+
+    Args:
+      node_name: Name of the node to be checked, as a str.
+
+    Returns:
+      A boolean indicating whether the node exists.
+
+    Raises:
+      RuntimeError: If no partition graphs have been loaded yet.
+    """
+
+    if self._node_inputs is None:
+      raise RuntimeError(
+          "Nodes have not been loaded from partition graphs yet.")
+
+    return node_name in self._node_inputs
 
   def node_device(self, node_name):
     """Get the device of a node.
@@ -793,7 +867,7 @@ class DebugDumpDir(object):
     """
     if self._node_devices is None:
       raise RuntimeError(
-          "Node devices are not loaded from partiton graphs yet.")
+          "Node devices are not loaded from partition graphs yet.")
 
     if node_name not in self._node_devices:
       raise ValueError("Node '%s' does not exist in partition graphs." %
@@ -817,7 +891,7 @@ class DebugDumpDir(object):
     """
     if self._node_op_types is None:
       raise RuntimeError(
-          "Node op types are not loaded from partiton graphs yet.")
+          "Node op types are not loaded from partition graphs yet.")
 
     if node_name not in self._node_op_types:
       raise ValueError("Node '%s' does not exist in partition graphs." %

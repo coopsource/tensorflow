@@ -18,6 +18,7 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import hashlib
 import inspect
 import re
 
@@ -127,24 +128,27 @@ def _add_op_node(op, func):
     op_def = op_def_registry.get_registered_ops()[op.type]
   # pylint: enable=protected-access
   attrs = _get_node_def_attr(op)
-  out_index = 0
-  for arg_def in op_def.output_arg:
-    if arg_def.number_attr:
-      dtype = arg_def.type or attrs[arg_def.type_attr].type
-      num = attrs[arg_def.number_attr].i
-      node.ret.append(
-          _add_output_array(op, out_index, out_index + num, dtype, func))
-      out_index += num
-    elif arg_def.type_list_attr:
-      dtype_lst = attrs[arg_def.type_list_attr].list.type
-      num = len(dtype_lst)
-      node.ret.append(
-          _add_output_list(op, out_index, out_index + num, dtype_lst, func))
-      out_index += num
-    else:
-      node.ret.append(
-          _make_argname_from_tensor_name(op.outputs[out_index].name))
-      out_index += 1
+  if not op_def.output_arg:
+    node.ret.append(_make_argname_from_tensor_name(op.name))
+  else:
+    out_index = 0
+    for arg_def in op_def.output_arg:
+      if arg_def.number_attr:
+        dtype = arg_def.type or attrs[arg_def.type_attr].type
+        num = attrs[arg_def.number_attr].i
+        node.ret.append(
+            _add_output_array(op, out_index, out_index + num, dtype, func))
+        out_index += num
+      elif arg_def.type_list_attr:
+        dtype_lst = attrs[arg_def.type_list_attr].list.type
+        num = len(dtype_lst)
+        node.ret.append(
+            _add_output_list(op, out_index, out_index + num, dtype_lst, func))
+        out_index += num
+      else:
+        node.ret.append(
+            _make_argname_from_tensor_name(op.outputs[out_index].name))
+        out_index += 1
   inp_index = 0
   for arg_def in op_def.input_arg:
     if arg_def.number_attr:
@@ -168,7 +172,7 @@ def _add_op_node(op, func):
   func.node.extend([node])
 
 
-def _graph_to_function_def(graph, name, inputs, outputs):
+def _graph_to_function_def(graph, inputs, outputs):
   """Returns `graph` as a `FunctionDef` protocol buffer.
 
   This method creates a [`FunctionDef`](
@@ -182,7 +186,6 @@ def _graph_to_function_def(graph, name, inputs, outputs):
 
   Args:
     graph: Graph.
-    name: string. The name to use for the function.
     inputs: List of tensors. Inputs to the function.
     outputs: List of tensors. Outputs of the function.
 
@@ -190,14 +193,14 @@ def _graph_to_function_def(graph, name, inputs, outputs):
     A FunctionDef protocol buffer.
   """
   func = function_pb2.FunctionDef()
-  func.signature.name = name
+  func.signature.name = "_"
   func.signature.input_arg.extend([_tensor_to_argdef(i) for i in inputs])
   func.signature.output_arg.extend([_tensor_to_argdef(o) for o in outputs])
   func_arg_placeholders = set([i.name for i in inputs])
   for op in graph.get_operations():
-    tensor_name = op.values()[0].name
-    if tensor_name not in func_arg_placeholders:
-      _add_op_node(op, func)
+    if op.values() and (op.values()[0].name in func_arg_placeholders):
+      continue
+    _add_op_node(op, func)
   return func
 
 
@@ -270,9 +273,7 @@ def _call(sig, *inputs, **kwargs):
 
 
 def _get_func_name(func):
-  if isinstance(func, _DefinedFunction):
-    return func.name
-  elif callable(func):
+  if callable(func):
     if inspect.isfunction(func):
       return func.__name__
     elif inspect.ismethod(func):
@@ -281,6 +282,39 @@ def _get_func_name(func):
       return type(func)
   else:
     raise ValueError("Argument must be callable")
+
+
+class _FuncGraph(ops.Graph):
+  """A helper for construction a function.
+
+  _FuncGraph overrides ops.Graph's create_op() so that we can keep
+  track of every inputs into every op created inside the function.  If
+  any input is from other graphs, we keep track of it in self.capture
+  and substitue the input with a place holder.
+
+  Each captured input's corresponding place holder is converted into a
+  function argument and the caller passes in the captured tensor.
+
+  """
+
+  def __init__(self, *args, **kwargs):
+    super(_FuncGraph, self).__init__(*args, **kwargs)
+    self._building_function = True
+    self.captured = {}
+
+  def create_op(self, op_type, inputs, data_types, **kwargs):
+    for i, x in enumerate(inputs):
+      if x.graph is not self:
+        # Referring to a tensor from other graph.
+        if x in self.captured:
+          # Captured already.
+          inputs[i] = self.captured[x]
+        else:
+          # Substitute with a placeholder.
+          inputs[i] = array_ops.placeholder(x.dtype)
+          self.captured[x] = inputs[i]
+    return super(_FuncGraph, self).create_op(op_type, inputs, data_types,
+                                             **kwargs)
 
 
 class _DefinedFunction(object):
@@ -296,6 +330,7 @@ class _DefinedFunction(object):
 
   def __init__(self,
                func,
+               argnames,
                input_types,
                func_name=None,
                grad_func=None,
@@ -305,6 +340,7 @@ class _DefinedFunction(object):
 
     Args:
       func:  A python callable which constructs a tf function body.
+      argnames: A list of strings for function argument names.
       input_types: The function's argument types. Can be a tuple, list of
         tf data types.
       func_name: The function name. Defaults to None, in which derives from
@@ -322,31 +358,11 @@ class _DefinedFunction(object):
     """
     self._func = func
     self._input_types = input_types
-    self._func_name = func_name or _get_func_name(func)
+    self._func_name = func_name
     self._grad_func = grad_func
     self._python_grad_func = python_grad_func
     self._extra_kwargs = kwargs
     self._definition = None  # Constructed lazily.
-
-    argspec = inspect.getargspec(func)
-    if argspec.keywords or argspec.defaults:
-      raise ValueError("Functions with argument defaults or keyword "
-                       "arguments are not supported.")
-    if inspect.isfunction(func):
-      if argspec.varargs and (
-          len(argspec.args) > len(input_types)) or not argspec.varargs and (
-              len(argspec.args) != len(input_types)):
-        raise ValueError("The function has fewer arguments "
-                         "than the number of specified input types.")
-      argnames = argspec.args
-    elif inspect.ismethod(func):
-      if argspec.varargs and (
-          len(argspec.args) > 1 + len(input_types)) or not argspec.varargs and (
-              len(argspec.args) != 1 + len(input_types)):
-        raise ValueError("The class function has fewer arguments "
-                         "than the number of specified input types.")
-      # 1st argument is the "class" type.
-      argnames = argspec.args[1:]
 
     self._args = []
     assert isinstance(input_types, (list, tuple))
@@ -358,6 +374,7 @@ class _DefinedFunction(object):
   @property
   def name(self):
     """Function name."""
+    self._create_definition_if_needed()
     return self._func_name
 
   @property
@@ -383,7 +400,7 @@ class _DefinedFunction(object):
       return
 
     # Create the func_def object.
-    temp_graph = ops.Graph()
+    temp_graph = _FuncGraph()
     with temp_graph.as_default():
       # List of placeholders for the function_def.
       inputs = []
@@ -392,21 +409,39 @@ class _DefinedFunction(object):
         inputs.append(argholder)
       # Call func and gather the output tensors.
       outputs = self._func(*inputs)
-      if not isinstance(outputs, ops.Tensor) and not outputs:
-        raise ValueError("Function must return at least one tensor")
-      # Convenience: if func only returned one value, make it a tuple.
+      # If func only returned one value, make it a tuple.
       if not isinstance(outputs, (list, tuple)):
         outputs = (outputs,)
+      if any([_ is None for _ in outputs]):
+        raise ValueError("Function can not return None.")
+      # Ensures each output is a Tensor.
+      outputs = [ops.convert_to_tensor(_) for _ in outputs]
+    self._extra_args = list(temp_graph.captured.keys())
+    inputs.extend([temp_graph.captured[arg] for arg in self._extra_args])
 
     # Build the FunctionDef
-    self._definition = _graph_to_function_def(temp_graph, self._func_name,
-                                              inputs, outputs)
+    self._definition = _graph_to_function_def(temp_graph, inputs, outputs)
+
+    # Hash the definition and its dependencies.
+    hasher = hashlib.sha1()
+    hasher.update(self._definition.SerializeToString())
     # pylint: disable=protected-access
     self._sub_functions = temp_graph._functions
+    for subname in sorted(self._sub_functions.keys()):
+      hasher.update(self._sub_functions[subname]._hash_str.encode("utf-8"))
     # pylint: enable=protected-access
-    self._hash = hash(self._definition.SerializeToString())
-    for item in self._sub_functions.items():  # OrderedDict
-      self._hash = hash((self._hash, item))
+
+    # Uses the first 8 bytes sha1 hash digest as the __hash__.
+    self._hash_str = hasher.hexdigest()[:8]
+    self._hash = int(self._hash_str, 16)
+
+    # Finally, we decide the function name to use.  If not specified,
+    # make up something which is almost certainly unique.
+    if not self._func_name:
+      self._func_name = "_".join([_get_func_name(self._func), self._hash_str])
+    self._definition.signature.name = self._func_name
+    if self._func.__doc__:
+      self._definition.signature.description = self._func.__doc__
 
   def __hash__(self):
     self._create_definition_if_needed()
@@ -436,11 +471,122 @@ class _DefinedFunction(object):
 
   def __call__(self, *args, **kwargs):
     self.add_to_graph(ops.get_default_graph())
+    args = [ops.convert_to_tensor(_) for _ in args] + self._extra_args
     if self._extra_kwargs:
       for k in self._extra_kwargs:
         if k not in kwargs:
           kwargs[k] = self._extra_kwargs[k]
     return _call(self._definition.signature, *args, **kwargs)
+
+
+# NOTE: The list needs to be extended when more data types are added.
+_DTYPE_TO_STR = {
+    dtypes.float16: "f16",
+    dtypes.float32: "f32",
+    dtypes.float64: "f64",
+    dtypes.int32: "i32",
+    dtypes.uint8: "i8",
+    dtypes.uint16: "u16",
+    dtypes.int16: "i16",
+    dtypes.int8: "i8",
+    dtypes.string: "s",
+    dtypes.complex64: "c64",
+    dtypes.complex128: "c128",
+    dtypes.int64: "i64",
+    dtypes.bool: "b",
+    dtypes.qint8: "qi8",
+    dtypes.quint8: "qu8",
+    dtypes.qint16: "qi16",
+    dtypes.quint16: "qu16",
+    dtypes.qint32: "qi32",
+    dtypes.bfloat16: "b16"
+}
+
+
+def _type_list_to_str(types):
+  if any([_ not in _DTYPE_TO_STR for _ in types]):
+    raise ValueError("Unsupported dtypes: %s" % types)
+  return "".join([_DTYPE_TO_STR[_] for _ in types])
+
+
+class _OverloadedFunction(object):
+  """_OverloadedFunction encapsulates an overloaded function.
+
+  _OverloadedFunction maintains a mapping from input types to
+  instantiated _DefinedFunction in self._overload.
+
+  """
+
+  def __init__(self,
+               func,
+               argnames,
+               func_name=None,
+               grad_func=None,
+               python_grad_func=None,
+               **kwargs):
+    """Creates _DefinedFunction.
+
+    Args:
+      func:  A python callable which constructs a tf function body.
+      argnames: A list of strings for function argument names.
+      func_name: The function name. Defaults to None, in which derives from
+        'func'.
+      grad_func: This function's gradient function, if not None. Defaults
+        to None.
+      python_grad_func: A python callable implementing the gradient of
+        the function python-side.
+      **kwargs: The keyword arguments. **kwargs is passed to every call
+        site of this function.
+
+    Raises:
+      ValueError: The function definition is invalid.
+
+    """
+    self._func = func
+    self._argnames = argnames
+    self._func_name = func_name
+    assert grad_func is None or isinstance(grad_func, _OverloadedFunction)
+    self._grad_func = grad_func
+    self._python_grad_func = python_grad_func
+    self._extra_kwargs = kwargs
+    self._overload = {}
+
+  def _instantiate(self, input_types):
+    """Instantiate this function given input argument types."""
+    # Stringify the type list.
+    key = _type_list_to_str(input_types)
+    defined = self._overload.get(key)
+    if not defined:
+      # If not defined yet, define the function given the input types.
+      name = self._func_name
+      if name is not None:
+        name = "_".join([name, key])
+      defined = _DefinedFunction(self._func, self._argnames, input_types,
+                                 name, None, self._python_grad_func,
+                                 **self._extra_kwargs)
+      if self._grad_func:
+        # If _grad_func is given, it is another
+        # _OverloadedFunction. We need to instantiate it with the
+        # right input types.
+        output_types = [dtypes.DType(_.type)
+                        for _ in defined.definition.signature.output_arg]
+        # pylint: disable=protected-access
+        defined._grad_func = self._grad_func._instantiate(input_types +
+                                                          output_types)
+        # pylint: enable=protected-access
+      self._overload[key] = defined
+    return defined
+
+  def __call__(self, *args, **kwargs):
+    input_types = []
+    args = list(args)
+    for (i, x) in enumerate(args):
+      x = ops.convert_to_tensor(x)
+      if not isinstance(x, ops.Tensor):
+        raise ValueError("Expect a Tensor but get ", x)
+      input_types.append(x.dtype)
+      args[i] = x
+    return self._instantiate(input_types)(*args, **kwargs)
 
 
 class Defun(object):
@@ -484,11 +630,11 @@ class Defun(object):
 
   """
 
-  def __init__(self, *input_type_list, **kwargs):
+  def __init__(self, *input_types, **kwargs):
     """Create a `Defun` decorator.
 
     Args:
-      *input_type_list: A list of `tf.DType`
+      *input_types: A list of `tf.DType`
       **kwargs: Optional keyword arguments, including
          func_name - (optional).  A python string, the name to use to
            declare this `Function` in the graph.
@@ -508,16 +654,55 @@ class Defun(object):
            to the graph. At most one of grad_func and python_grad_func
            can be specified.
     """
-    self._input_type_list = input_type_list
+    self._input_types = input_types
     self._func_name = kwargs.pop("func_name", None)
     self._grad_func = kwargs.pop("grad_func", None)
     self._python_grad_func = kwargs.pop("python_grad_func", None)
     self._extra_kwargs = kwargs
 
-  def __call__(self, f):
-    return _DefinedFunction(f, self._input_type_list, self._func_name,
-                            self._grad_func, self._python_grad_func,
-                            **self._extra_kwargs)
+  def __call__(self, func):
+    # Various sanity checks on the callable func.
+    if not callable(func):
+      raise ValueError("func %s must be callable" % func)
+
+    # Func should not use kwargs and defaults.
+    argspec = inspect.getargspec(func)
+    if argspec.keywords or argspec.defaults:
+      raise ValueError("Functions with argument defaults or keyword "
+                       "arguments are not supported.")
+
+    # Computes how many arguments 'func' has.
+    min_args = len(argspec.args)
+    max_args = min_args
+    if argspec.varargs:
+      max_args = 1000000
+    argnames = argspec.args
+    if inspect.ismethod(func):
+      # 1st argument is the "class" type.
+      min_args -= 1
+      argnames = argnames[1:]
+
+    if self._input_types:
+      # If Defun is given a list of types for the inputs, the number
+      # of of input types should be compatible with 'func'.
+      num = len(self._input_types)
+      if num < min_args or num > max_args:
+        raise ValueError(
+            "The function has fewer arguments than the number of specified "
+            "input types.")
+      return _DefinedFunction(func, argnames, self._input_types,
+                              self._func_name, self._grad_func,
+                              self._python_grad_func, **self._extra_kwargs)
+
+    # 'func' expects no arguments and input types is an empty list.
+    if min_args == 0 and max_args == 0:
+      return _DefinedFunction(func, [], [], self._func_name, self._grad_func,
+                              self._python_grad_func, **self._extra_kwargs)
+
+    # Input types are unknown. It's an overloaded function and hence
+    # its definition needs to be deferred until it's called.
+    return _OverloadedFunction(func, argnames, self._func_name, self._grad_func,
+                               self._python_grad_func, **self._extra_kwargs)
 
 
 class Declare(object):
@@ -561,4 +746,5 @@ class Declare(object):
     self._sig.output_arg.extend(_to_argdef_list(output_types))
 
   def __call__(self, *inputs, **kwargs):
+    inputs = [ops.convert_to_tensor(_) for _ in inputs]
     return _call(self._sig, *inputs, **kwargs)

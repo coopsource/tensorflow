@@ -15,6 +15,7 @@ limitations under the License.
 
 import {DataSet} from './scatterPlot';
 import {Point2D} from './vector';
+import {DataPoint} from './data';
 
 /** Shuffles the array in-place in O(n) time using Fisher-Yates algorithm. */
 export function shuffle<T>(array: T[]): T[] {
@@ -37,9 +38,9 @@ export function shuffle<T>(array: T[]): T[] {
 /** Retrieves a projected point from the data set as a THREE.js vector */
 export function getProjectedPointFromIndex(
     dataSet: DataSet, i: number): THREE.Vector3 {
-  return new THREE.Vector3(
-      dataSet.points[i].projectedPoint[0], dataSet.points[i].projectedPoint[1],
-      dataSet.points[i].projectedPoint[2]);
+  let pp = dataSet.points[i].projectedPoint;
+  let v = new THREE.Vector3(pp[0], pp[1], pp[2]);
+  return v;
 }
 
 /** Projects a 3d point into screen space */
@@ -102,4 +103,23 @@ export function assert(condition: boolean, message?: string) {
     message = message || 'Assertion failed';
     throw new Error(message);
   }
+}
+
+export type SearchPredicate = (p: DataPoint) => boolean;
+
+export function getSearchPredicate(query: string, inRegexMode: boolean,
+    fieldName: string): SearchPredicate {
+  let predicate: SearchPredicate;
+  if (inRegexMode) {
+    let regExp = new RegExp(query, 'i');
+    predicate = p => regExp.test(p.metadata[fieldName].toString());
+  } else {
+    // Doing a case insensitive substring match.
+    query = query.toLowerCase();
+    predicate = p => {
+      let label = p.metadata[fieldName].toString().toLowerCase();
+      return label.indexOf(query) >= 0;
+    };
+  }
+  return predicate;
 }

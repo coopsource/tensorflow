@@ -1228,10 +1228,10 @@ int TF_OperationGetControlOutputs(TF_Operation* oper,
   return count;
 }
 
-TF_Attr_Metadata TF_OperationGetAttrMetadata(TF_Operation* oper,
-                                             const char* attr_name,
-                                             TF_Status* status) {
-  TF_Attr_Metadata metadata;
+TF_AttrMetadata TF_OperationGetAttrMetadata(TF_Operation* oper,
+                                            const char* attr_name,
+                                            TF_Status* status) {
+  TF_AttrMetadata metadata;
   const auto* attr = GetAttrValue(oper, attr_name, status);
   if (!status->status.ok()) return metadata;
   switch (attr->value_case()) {
@@ -1544,7 +1544,7 @@ TF_Operation* TF_GraphOperationByName(TF_Graph* graph, const char* oper_name) {
 
 TF_Operation* TF_GraphNextOperation(TF_Graph* graph, size_t* pos) {
   if (*pos == 0) {
-    // Advance past the first sentinal nodes in every graph (the source & sink).
+    // Advance past the first sentinel nodes in every graph (the source & sink).
     *pos += 2;
   } else {
     // Advance to the next node.
